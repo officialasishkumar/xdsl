@@ -93,7 +93,7 @@
     }) {"sym_name" = "gpu"} : () -> ()
 }) {} : () -> ()
 
-// CHECK: Expected [12 x index], got ['index', 'index', 'index', 'index', 'index', 'index']. gpu.launch's body arguments are 12 index arguments, with 3 block indices, 3 block sizes, 3 thread indices, and 3 thread counts
+// CHECK: Expected 12 index arguments followed by 0 workgroup attributions, got ['index', 'index', 'index', 'index', 'index', 'index']. gpu.launch's body arguments are 3 block identifiers, 3 thread identifiers, 3 grid sizes, 3 block sizes, then 3 cluster identifiers and 3 cluster sizes if cluster sizes are present, followed by the workgroup and private memory attributions
 
 // -----
 
@@ -108,6 +108,81 @@
 }) {} : () -> ()
 
 // CHECK: gpu.launch requires a non-empty body.
+
+// -----
+
+%one = "test.op"() : () -> index
+"gpu.launch"(%one, %one, %one, %one, %one, %one, %one) <{operandSegmentSizes = array<i32: 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0>}> ({
+^bb0(%bx : index, %by : index, %bz : index, %tx : index, %ty : index, %tz : index,
+     %gx : index, %gy : index, %gz : index, %sx : index, %sy : index, %sz : index):
+  gpu.terminator
+}) : (index, index, index, index, index, index, index) -> ()
+
+// CHECK: gpu.launch cluster sizes must all be present
+
+// -----
+
+%one = "test.op"() : () -> index
+gpu.launch clusters(%cx, %cy, %cz) in (%scx = %one, %scy = %one, %scz = %one)
+    blocks(%bx, %by, %bz) in (%gx = %one, %gy = %one, %gz = %one)
+    threads(%tx, %ty, %tz) in (%sx = %one, %sy = %one, %sz = %one)
+    workgroup(%workgroup : i32) {
+  gpu.terminator
+}
+
+// CHECK: Expected memref type in attribution, got i32
+
+// -----
+
+%one = "test.op"() : () -> index
+"gpu.launch"(%one, %one, %one, %one, %one, %one) <{operandSegmentSizes = array<i32: 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0>}> ({
+^bb0(%bx : index, %by : index, %bz : index, %tx : index, %ty : index, %tz : index,
+     %gx : index, %gy : index, %gz : index, %sx : index, %sy : index, %sz : index):
+  gpu.terminator
+}) {workgroup_attributions = 1 : i64} : (index, index, index, index, index, index) -> ()
+
+// CHECK: Expected 12 index arguments followed by 1 workgroup attributions, got
+
+// -----
+
+%one = "test.op"() : () -> index
+"gpu.launch"(%one, %one, %one, %one, %one, %one) <{operandSegmentSizes = array<i32: 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0>}> ({
+^bb0(%bx : index, %by : index, %bz : index, %tx : index, %ty : index, %tz : index,
+     %gx : index, %gy : index, %gz : index, %sx : index, %sy : index, %sz : index):
+  gpu.terminator
+}) {workgroup_attributions = -1 : i64} : (index, index, index, index, index, index) -> ()
+
+// CHECK: Expected a non-negative number of workgroup attributions, got -1
+
+// -----
+
+%one = "test.op"() : () -> index
+gpu.launch blocks(%bx, %by) in (%gx = %one, %gy = %one, %gz = %one)
+    threads(%tx, %ty, %tz) in (%sx = %one, %sy = %one, %sz = %one) {
+  gpu.terminator
+}
+
+// CHECK: Expected 3 identifiers, got 2
+
+// -----
+
+%one = "test.op"() : () -> index
+gpu.launch blocks(%bx, %by, %bz) in (%gx = %one, %gy = %one, %gz = %one)
+    threads(%tx, %ty, %tz) in (%sx = %one, %sy = %one) {
+  gpu.terminator
+}
+
+// CHECK: Expected 3 size assignments, got 2
+
+// -----
+
+%one = "test.op"() : () -> index
+gpu.launch blocks(%bx, %by, %bz) in (%gx = %one, %gy = %one, %gz = %one)
+    threads(%tx, %ty, %tz) in (%sx = %one, %sy = %one, %sz = %one) {
+  gpu.terminator
+} {workgroup_attributions = 0 : i64}
+
+// CHECK: Attribute dictionary entry 'workgroup_attributions' is already passed through the operation custom assembly format
 
 // -----
 

@@ -277,6 +277,57 @@ def test_launch():
     assert nd_launch.dynamicSharedMemorySize is ten.result
 
 
+def test_launch_clusters_and_attributions():
+    workgroup_type = builtin.MemRefType(builtin.f32, [32])
+    private_type = builtin.MemRefType(builtin.f32, [1])
+    body = Region(
+        Block(
+            [TerminatorOp()],
+            arg_types=(
+                (builtin.IndexType(),) * 18
+                + (workgroup_type, workgroup_type, private_type)
+            ),
+        )
+    )
+    ten = arith.ConstantOp.from_int_and_width(10, builtin.IndexType())
+    sizes: list[OperandArg] = [ten, ten, ten]
+    launch = LaunchOp(
+        body,
+        sizes,
+        sizes,
+        sizes,
+        num_workgroup_attributions=2,
+        module="kernel_module",
+        function="kernel_func",
+    )
+    launch.verify()
+
+    args = body.block.args
+    assert launch.has_cluster_size
+    assert launch.num_config_region_args == 18
+    assert launch.num_workgroup_attributions == builtin.IntegerAttr(2, builtin.i64)
+    assert launch.workgroup_attributions == args[18:20]
+    assert launch.private_attributions == args[20:]
+    assert launch.module == builtin.SymbolRefAttr("kernel_module")
+    assert launch.function == builtin.SymbolRefAttr("kernel_func")
+
+
+def test_launch_without_attributions():
+    body = Region(Block([TerminatorOp()], arg_types=(builtin.IndexType(),) * 12))
+    ten = arith.ConstantOp.from_int_and_width(10, builtin.IndexType())
+    sizes: list[OperandArg] = [ten, ten, ten]
+    launch = LaunchOp(body, sizes, sizes)
+    launch.verify()
+
+    assert not launch.has_cluster_size
+    assert launch.num_config_region_args == 12
+    assert launch.num_workgroup_attributions == builtin.IntegerAttr(0, builtin.i64)
+    assert launch.workgroup_attributions == ()
+    assert launch.private_attributions == ()
+    assert launch.module is None
+    assert launch.function is None
+
+
 def test_launchfunc():
     kernel = builtin.SymbolRefAttr("root", ["gpu", "kernel"])
     args = [arith.ConstantOp.from_int_and_width(10, builtin.IndexType())]

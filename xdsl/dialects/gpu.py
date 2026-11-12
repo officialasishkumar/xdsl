@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from enum import auto
+from typing import ClassVar, Self
 
 from xdsl.dialects import memref
 from xdsl.dialects.builtin import (
     DYNAMIC_INDEX,
+    I64,
     AffineMapAttr,
     DenseArrayBase,
+    FlatSymbolRefAttrConstr,
     FunctionType,
     IndexType,
+    IntegerAttr,
+    MemRefType,
     StringAttr,
     SymbolNameConstraint,
     SymbolRefAttr,
@@ -17,10 +22,11 @@ from xdsl.dialects.builtin import (
     i32,
     i64,
 )
-from xdsl.dialects.utils import EnumAttribute
+from xdsl.dialects.utils import EnumAttribute, parse_assignment, print_assignment
 from xdsl.ir import (
     Attribute,
     Block,
+    BlockArgument,
     Dialect,
     OperandArg,
     ParametrizedAttribute,
@@ -47,7 +53,7 @@ from xdsl.irdl import (
     traits_def,
     var_operand_def,
 )
-from xdsl.parser import AttrParser
+from xdsl.parser import AttrParser, Parser
 from xdsl.printer import Printer
 from xdsl.traits import (
     HasParent,
@@ -482,6 +488,32 @@ class LaneIdOp(IRDLOperation):
 
 @irdl_op_definition
 class LaunchOp(IRDLOperation):
+    """
+    Launch a kernel on the specified grid of thread blocks. The body of the kernel is
+    defined by the single region that this operation contains.
+
+    The operation takes an optional list of async dependencies, the grid and block
+    sizes along the x,y,z dimensions, optional cluster sizes along the x,y,z
+    dimensions, and an optional amount of dynamic shared memory.
+
+    The body region has at least twelve arguments, or eighteen if cluster sizes are
+    present, grouped as follows:
+
+    - three arguments that contain block identifiers along x,y,z dimensions;
+    - three arguments that contain thread identifiers along x,y,z dimensions;
+    - the grid and block sizes, as passed in the operands;
+    - if cluster sizes are present, three arguments that contain cluster identifiers
+      along x,y,z dimensions, followed by the cluster sizes;
+    - a variadic number of workgroup memory attributions;
+    - a variadic number of private memory attributions.
+
+    The number of workgroup memory attributions is stored in the
+    `workgroup_attributions` attribute. The optional `module` and `function`
+    properties specify the module and the name of the kernel to outline the body to.
+
+    See external [documentation](https://mlir.llvm.org/docs/Dialects/GPU/#gpulaunch-gpulaunchop).
+    """
+
     name = "gpu.launch"
     asyncDependencies = var_operand_def(AsyncTokenType)
     gridSizeX = operand_def(IndexType)
@@ -494,9 +526,26 @@ class LaunchOp(IRDLOperation):
     clusterSizeY = opt_operand_def(IndexType)
     clusterSizeZ = opt_operand_def(IndexType)
     dynamicSharedMemorySize = opt_operand_def(i32)
+    module = opt_prop_def(FlatSymbolRefAttrConstr)
+    function = opt_prop_def(FlatSymbolRefAttrConstr)
+    num_workgroup_attributions = opt_attr_def(
+        IntegerAttr[I64], attr_name="workgroup_attributions"
+    )
     asyncToken = opt_result_def(AsyncTokenType)
     body = region_def()
     irdl_options = (AttrSizedOperandSegments(as_property=True),)
+
+    NUM_CONFIG_REGION_ARGS: ClassVar[int] = 12
+    """
+    The number of body arguments for the block and thread identifiers and the grid
+    and block sizes, placed at the leading positions of the arguments.
+    """
+
+    NUM_CLUSTER_REGION_ARGS: ClassVar[int] = 6
+    """
+    The number of body arguments for the cluster identifiers and sizes, following
+    the other configuration arguments when cluster sizes are present.
+    """
 
     def __init__(
         self,
@@ -507,6 +556,10 @@ class LaunchOp(IRDLOperation):
         async_launch: bool = False,
         asyncDependencies: Sequence[OperandArg] | None = None,
         dynamicSharedMemorySize: OperandArg | None = None,
+        *,
+        num_workgroup_attributions: int = 0,
+        module: str | SymbolRefAttr | None = None,
+        function: str | SymbolRefAttr | None = None,
     ):
         if len(gridSize) != 3:
             raise ValueError(f"LaunchOp must have 3 gridSizes, got {len(gridSize)}")
@@ -537,22 +590,298 @@ class LaunchOp(IRDLOperation):
                 else [SSAValue.get(dynamicSharedMemorySize)]
             )
         ]
+        if isinstance(module, str):
+            module = SymbolRefAttr(module)
+        if isinstance(function, str):
+            function = SymbolRefAttr(function)
         super().__init__(
             operands=operands,
             result_types=[[AsyncTokenType()] if async_launch else []],
+            properties={"module": module, "function": function},
+            attributes={
+                "workgroup_attributions": IntegerAttr(num_workgroup_attributions, i64)
+            },
             regions=[body],
         )
 
+    @property
+    def has_cluster_size(self) -> bool:
+        """Whether the cluster sizes are specified."""
+        return (
+            self.clusterSizeX is not None
+            and self.clusterSizeY is not None
+            and self.clusterSizeZ is not None
+        )
+
+    @property
+    def num_config_region_args(self) -> int:
+        """
+        The number of leading body arguments for the launch configuration, including
+        the cluster identifiers and sizes if present.
+        """
+        if self.has_cluster_size:
+            return self.NUM_CONFIG_REGION_ARGS + self.NUM_CLUSTER_REGION_ARGS
+        return self.NUM_CONFIG_REGION_ARGS
+
+    @property
+    def workgroup_attributions(self) -> tuple[BlockArgument, ...]:
+        """The body arguments for the buffers located in workgroup memory."""
+        if self.num_workgroup_attributions is None:
+            return ()
+        start = self.num_config_region_args
+        end = start + self.num_workgroup_attributions.value.data
+        return self.body.blocks[0].args[start:end]
+
+    @property
+    def private_attributions(self) -> tuple[BlockArgument, ...]:
+        """The body arguments for the buffers located in private memory."""
+        start = self.num_config_region_args + len(self.workgroup_attributions)
+        return self.body.blocks[0].args[start:]
+
     def verify_(self) -> None:
+        cluster_sizes = (self.clusterSizeX, self.clusterSizeY, self.clusterSizeZ)
+        if not self.has_cluster_size and any(s is not None for s in cluster_sizes):
+            raise VerifyException("gpu.launch cluster sizes must all be present")
         if not any(b.ops for b in self.body.blocks):
             raise VerifyException("gpu.launch requires a non-empty body.")
-        args_type = self.body.blocks[0].arg_types
-        if args_type != (IndexType(),) * 12:
+
+        num_config_args = self.num_config_region_args
+        num_workgroup_attributions = (
+            0
+            if self.num_workgroup_attributions is None
+            else self.num_workgroup_attributions.value.data
+        )
+        if num_workgroup_attributions < 0:
             raise VerifyException(
-                f"Expected [12 x {IndexType()!s}], got {[str(t) for t in args_type]}. "
-                "gpu.launch's body arguments are 12 index arguments, with 3 block "
-                "indices, 3 block sizes, 3 thread indices, and 3 thread counts"
+                "Expected a non-negative number of workgroup attributions, got "
+                f"{num_workgroup_attributions}"
             )
+        args_type = self.body.blocks[0].arg_types
+        config_args_type = args_type[:num_config_args]
+        if (
+            len(args_type) < num_config_args + num_workgroup_attributions
+            or config_args_type != (IndexType(),) * num_config_args
+        ):
+            raise VerifyException(
+                f"Expected {num_config_args} index arguments followed by "
+                f"{num_workgroup_attributions} workgroup attributions, got "
+                f"{[str(t) for t in args_type]}. gpu.launch's body arguments are 3 "
+                "block identifiers, 3 thread identifiers, 3 grid sizes, 3 block sizes, "
+                "then 3 cluster identifiers and 3 cluster sizes if cluster sizes are "
+                "present, followed by the workgroup and private memory attributions"
+            )
+
+        for attribution in self.workgroup_attributions + self.private_attributions:
+            if not isinstance(attribution.type, MemRefType):
+                raise VerifyException(
+                    f"Expected memref type in attribution, got {attribution.type}"
+                )
+
+    def print(self, printer: Printer) -> None:
+        if self.asyncToken is not None:
+            printer.print_string(" async")
+        if self.asyncDependencies:
+            printer.print_string(" [")
+            printer.print_list(self.asyncDependencies, printer.print_operand)
+            printer.print_string("]")
+
+        args = self.body.blocks[0].args
+        if self.has_cluster_size:
+            cluster_sizes = tuple(
+                size
+                for size in (self.clusterSizeX, self.clusterSizeY, self.clusterSizeZ)
+                if size is not None
+            )
+            printer.print_string(" clusters")
+            _print_size_assignment(printer, args[12:15], args[15:18], cluster_sizes)
+        printer.print_string(" blocks")
+        _print_size_assignment(
+            printer,
+            args[0:3],
+            args[6:9],
+            (self.gridSizeX, self.gridSizeY, self.gridSizeZ),
+        )
+        printer.print_string(" threads")
+        _print_size_assignment(
+            printer,
+            args[3:6],
+            args[9:12],
+            (self.blockSizeX, self.blockSizeY, self.blockSizeZ),
+        )
+        if self.dynamicSharedMemorySize is not None:
+            printer.print_string(" dynamic_shared_memory_size ")
+            printer.print_operand(self.dynamicSharedMemorySize)
+        if self.module is not None:
+            printer.print_string(" module(")
+            printer.print_symbol_name(self.module.root_reference)
+            printer.print_string(")")
+        if self.function is not None:
+            printer.print_string(" function(")
+            printer.print_symbol_name(self.function.root_reference)
+            printer.print_string(")")
+        _print_attributions(printer, "workgroup", self.workgroup_attributions)
+        _print_attributions(printer, "private", self.private_attributions)
+        printer.print_string(" ")
+        printer.print_region(
+            self.body, print_entry_block_args=False, print_empty_block=False
+        )
+        printer.print_op_attributes(
+            self.attributes, reserved_attr_names=("workgroup_attributions",)
+        )
+
+    @classmethod
+    def parse(cls, parser: Parser) -> Self:
+        async_launch = parser.parse_optional_keyword("async") is not None
+        async_dependencies = parser.parse_optional_comma_separated_list(
+            Parser.Delimiter.SQUARE, lambda: parser.parse_operand(AsyncTokenType())
+        )
+
+        cluster_ids: Sequence[Parser.UnresolvedArgument] = ()
+        cluster_size_args: Sequence[Parser.UnresolvedArgument] = ()
+        cluster_sizes: Sequence[SSAValue] = ()
+        if parser.parse_optional_keyword("clusters") is not None:
+            cluster_ids, cluster_size_args, cluster_sizes = _parse_size_assignment(
+                parser
+            )
+        parser.parse_keyword("blocks")
+        block_ids, grid_size_args, grid_sizes = _parse_size_assignment(parser)
+        parser.parse_keyword("threads")
+        thread_ids, block_size_args, block_sizes = _parse_size_assignment(parser)
+
+        dynamic_shared_memory_size = None
+        if parser.parse_optional_keyword("dynamic_shared_memory_size") is not None:
+            dynamic_shared_memory_size = parser.parse_operand(i32)
+
+        module = None
+        if parser.parse_optional_keyword("module") is not None:
+            with parser.in_parens():
+                module = SymbolRefAttr(parser.parse_symbol_name())
+        function = None
+        if parser.parse_optional_keyword("function") is not None:
+            with parser.in_parens():
+                function = SymbolRefAttr(parser.parse_symbol_name())
+
+        workgroup_attributions = _parse_attributions(parser, "workgroup")
+        private_attributions = _parse_attributions(parser, "private")
+
+        config_args = (
+            *block_ids,
+            *thread_ids,
+            *grid_size_args,
+            *block_size_args,
+            *cluster_ids,
+            *cluster_size_args,
+        )
+        body = parser.parse_region(
+            (
+                *(arg.resolve(IndexType()) for arg in config_args),
+                *workgroup_attributions,
+                *private_attributions,
+            )
+        )
+        attrs = parser.parse_optional_attr_dict_with_reserved_attr_names(
+            ("workgroup_attributions",)
+        )
+
+        op = cls(
+            body,
+            grid_sizes,
+            block_sizes,
+            cluster_sizes,
+            async_launch,
+            async_dependencies,
+            dynamic_shared_memory_size,
+            num_workgroup_attributions=len(workgroup_attributions),
+            module=module,
+            function=function,
+        )
+        if attrs is not None:
+            op.attributes |= attrs.data
+        return op
+
+
+def _print_size_assignment(
+    printer: Printer,
+    ids: Sequence[BlockArgument],
+    size_args: Sequence[BlockArgument],
+    sizes: Sequence[SSAValue],
+) -> None:
+    """
+    Print a launch size assignment, with format:
+      `(` ids `)` `in` `(` size-arg `=` size (`,` size-arg `=` size)* `)`
+    """
+    with printer.in_parens():
+        printer.print_list(ids, printer.print_ssa_value)
+    printer.print_string(" in ")
+    with printer.in_parens():
+        printer.print_list(
+            zip(size_args, sizes), lambda pair: print_assignment(printer, *pair)
+        )
+
+
+def _parse_size_assignment(
+    parser: Parser,
+) -> tuple[
+    list[Parser.UnresolvedArgument],
+    list[Parser.UnresolvedArgument],
+    list[SSAValue[IndexType]],
+]:
+    """
+    Parse a launch size assignment, with format:
+      `(` ids `)` `in` `(` size-arg `=` size (`,` size-arg `=` size)* `)`
+    where there are exactly three identifiers and sizes, for the x, y and z
+    dimensions.
+    """
+    pos = parser.pos
+    ids = parser.parse_comma_separated_list(
+        Parser.Delimiter.PAREN, lambda: parser.parse_argument(expect_type=False)
+    )
+    if len(ids) != 3:
+        parser.raise_error(f"Expected 3 identifiers, got {len(ids)}", pos, parser.pos)
+    parser.parse_keyword("in")
+    pos = parser.pos
+    assignments = parser.parse_comma_separated_list(
+        Parser.Delimiter.PAREN, lambda: parse_assignment(parser)
+    )
+    if len(assignments) != 3:
+        parser.raise_error(
+            f"Expected 3 size assignments, got {len(assignments)}", pos, parser.pos
+        )
+    size_args = [arg for arg, _ in assignments]
+    sizes = [parser.resolve_operand(size, IndexType()) for _, size in assignments]
+    return ids, size_args, sizes
+
+
+def _print_attributions(
+    printer: Printer, keyword: str, attributions: Sequence[BlockArgument]
+) -> None:
+    """
+    Print memory attributions, if any, with format:
+      keyword `(` ssa-id `:` type (`,` ssa-id `:` type)* `)`
+    """
+    if not attributions:
+        return
+    printer.print_string(f" {keyword}")
+    with printer.in_parens():
+        printer.print_list(attributions, lambda arg: _print_attribution(printer, arg))
+
+
+def _print_attribution(printer: Printer, attribution: BlockArgument) -> None:
+    printer.print_ssa_value(attribution)
+    printer.print_string(" : ")
+    printer.print_attribute(attribution.type)
+
+
+def _parse_attributions(parser: Parser, keyword: str) -> list[Parser.Argument]:
+    """
+    Parse memory attributions, if present, with format:
+      keyword `(` ssa-id `:` type (`,` ssa-id `:` type)* `)`
+    """
+    if parser.parse_optional_keyword(keyword) is None:
+        return []
+    return parser.parse_comma_separated_list(
+        Parser.Delimiter.PAREN, parser.parse_argument
+    )
 
 
 @irdl_op_definition
@@ -700,6 +1029,8 @@ class TerminatorOp(IRDLOperation):
     name = "gpu.terminator"
 
     traits = traits_def(HasParent(LaunchOp), IsTerminator())
+
+    assembly_format = "attr-dict"
 
     def __init__(self):
         super().__init__()

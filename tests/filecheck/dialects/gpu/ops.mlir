@@ -68,6 +68,22 @@ builtin.module attributes {"gpu.container_module"} {
                 %final = arith.muli %sum, %one : index
                 "gpu.terminator"() : () -> ()
             }) {operandSegmentSizes = array<i32: 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0>} : (index, index, index, index, index, index) -> ()
+            %launch_token = gpu.launch async [%wait_token] clusters(%cx, %cy, %cz) in (%num_cx = %one, %num_cy = %one, %num_cz = %one)
+                blocks(%bx2, %by2, %bz2) in (%num_bx2 = %one, %num_by2 = %one, %num_bz2 = %one)
+                threads(%tx2, %ty2, %tz2) in (%num_tx2 = %n, %num_ty2 = %one, %num_tz2 = %one)
+                dynamic_shared_memory_size %dev
+                module(@kernel_module) function(@kernel_func)
+                workgroup(%workgroup : memref<32xf32, 3>, %workgroup2 : memref<16xi32, 3>)
+                private(%private : memref<1xf32, 5>) {
+                "test.op"(%cx, %num_cz, %workgroup, %workgroup2, %private) : (index, index, memref<32xf32, 3>, memref<16xi32, 3>, memref<1xf32, 5>) -> ()
+                gpu.terminator
+            } {launch_attr}
+            gpu.launch [%launch_token] blocks(%bx3, %by3, %bz3) in (%num_bx3 = %one, %num_by3 = %one, %num_bz3 = %one)
+                threads(%tx3, %ty3, %tz3) in (%num_tx3 = %one, %num_ty3 = %one, %num_tz3 = %one)
+                private(%private3 : memref<1xf32, 5>) {
+                "test.op"(%private3) : (memref<1xf32, 5>) -> ()
+                gpu.terminator
+            }
             "gpu.launch_func"(%n, %n, %n, %n, %n, %n, %dev, %n) {operandSegmentSizes = array<i32: 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0>, "kernel" = @gpu::@foo} : (index, index, index, index, index, index, i32, index) -> ()
 
             func.return
@@ -137,16 +153,20 @@ builtin.module attributes {"gpu.container_module"} {
 // CHECK-NEXT:                 "gpu.yield"(%{{.*}}) : (index) -> ()
 // CHECK-NEXT:             }) : (index) -> index
 
-// CHECK-NEXT:             "gpu.launch"(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) <{operandSegmentSizes = array<i32: 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0>}> ({
-// CHECK-NEXT:             ^{{\S+}}(%{{\S+}}: index, %{{\S+}}: index, %{{\S+}}: index,
-// CHECK-SAME:                 %{{\S+}}: index, %{{\S+}}: index, %{{\S+}}: index,
-// CHECK-SAME:                 %{{\S+}}: index, %{{\S+}}: index, %{{\S+}}: index,
-// CHECK-SAME:                 %{{\S+}}: index, %{{\S+}}: index, %{{\S+}}: index):
+// CHECK-NEXT:             gpu.launch blocks(%{{.*}}, %{{.*}}, %{{.*}}) in (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) threads(%{{.*}}, %{{.*}}, %{{.*}}) in (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) {
 // CHECK-NEXT:                 %{{.*}} = "gpu.all_reduce"(%{{.*}}) <{op = #gpu<all_reduce_op add>}> ({
 // CHECK-NEXT:                 }) : (index) -> index
 // CHECK-NEXT:                 %{{.*}} = arith.muli %{{.*}}, %{{.*}} : index
-// CHECK-NEXT:                 "gpu.terminator"() : () -> ()
-// CHECK-NEXT:             }) : (index, index, index, index, index, index) -> ()
+// CHECK-NEXT:                 gpu.terminator
+// CHECK-NEXT:             }
+// CHECK-NEXT:             %launch_token = gpu.launch async [%wait_token] clusters(%cx, %cy, %cz) in (%num_cx = %one, %num_cy = %one, %num_cz = %one) blocks(%bx2, %by2, %bz2) in (%num_bx2 = %one, %num_by2 = %one, %num_bz2 = %one) threads(%tx2, %ty2, %tz2) in (%num_tx2 = %n, %num_ty2 = %one, %num_tz2 = %one) dynamic_shared_memory_size %dev module(@kernel_module) function(@kernel_func) workgroup(%workgroup : memref<32xf32, 3 : i64>, %workgroup2 : memref<16xi32, 3 : i64>) private(%private : memref<1xf32, 5 : i64>) {
+// CHECK-NEXT:                 "test.op"(%cx, %num_cz, %workgroup, %workgroup2, %private) : (index, index, memref<32xf32, 3 : i64>, memref<16xi32, 3 : i64>, memref<1xf32, 5 : i64>) -> ()
+// CHECK-NEXT:                 gpu.terminator
+// CHECK-NEXT:             } {launch_attr}
+// CHECK-NEXT:             gpu.launch [%launch_token] blocks(%bx3, %by3, %bz3) in (%num_bx3 = %one, %num_by3 = %one, %num_bz3 = %one) threads(%tx3, %ty3, %tz3) in (%num_tx3 = %one, %num_ty3 = %one, %num_tz3 = %one) private(%private3 : memref<1xf32, 5 : i64>) {
+// CHECK-NEXT:                 "test.op"(%private3) : (memref<1xf32, 5 : i64>) -> ()
+// CHECK-NEXT:                 gpu.terminator
+// CHECK-NEXT:             }
 // CHECK-NEXT:             "gpu.launch_func"(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) <{kernel = @gpu::@foo, operandSegmentSizes = array<i32: 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0>}> : (index, index, index, index, index, index, i32, index) -> ()
 
 // CHECK-NEXT:             func.return
